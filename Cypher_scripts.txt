@@ -1,0 +1,459 @@
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║  0.  SCHEMA  – constraints & indexes                          ║
+// ╚═══════════════════════════════════════════════════════════════╝
+CREATE CONSTRAINT crash_id_unique        IF NOT EXISTS FOR (c:Crash)        REQUIRE c.crash_id   IS UNIQUE;
+CREATE CONSTRAINT person_id_unique       IF NOT EXISTS FOR (p:Person)       REQUIRE p.person_id  IS UNIQUE;
+
+CREATE CONSTRAINT state_name_unique      IF NOT EXISTS FOR (s:State)        REQUIRE s.name       IS UNIQUE;
+CREATE CONSTRAINT sa4_name_unique        IF NOT EXISTS FOR (sa:SA4)         REQUIRE sa.name      IS UNIQUE;
+CREATE CONSTRAINT lga_name_unique        IF NOT EXISTS FOR (l:LGA)          REQUIRE l.name       IS UNIQUE;
+CREATE CONSTRAINT remote_name_unique     IF NOT EXISTS FOR (r:Remoteness)   REQUIRE r.name       IS UNIQUE;
+CREATE CONSTRAINT roadtype_name_unique   IF NOT EXISTS FOR (rt:RoadType)    REQUIRE rt.name      IS UNIQUE;
+CREATE CONSTRAINT dayflag_name_unique    IF NOT EXISTS FOR (df:DayFlag)     REQUIRE df.name      IS UNIQUE;
+CREATE CONSTRAINT timeofday_name_unique  IF NOT EXISTS FOR (tod:TimeOfDay)  REQUIRE tod.name     IS UNIQUE;
+CREATE CONSTRAINT dayweek_name_unique    IF NOT EXISTS FOR (dw:DayWeek)     REQUIRE dw.name      IS UNIQUE;
+CREATE CONSTRAINT holiday_name_unique    IF NOT EXISTS FOR (h:HolidayPeriod)REQUIRE h.name       IS UNIQUE;
+CREATE CONSTRAINT vehicletype_name_unique IF NOT EXISTS FOR (v:VehicleType) REQUIRE v.name       IS UNIQUE;
+
+/* composite index used by several queries */
+CREATE INDEX crash_year_month_dayflag_idx IF NOT EXISTS
+FOR (c:Crash) ON (c.year, c.month, c.day_flag);
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║  1.  DIMENSION NODES                                          ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// DIMENSION TABLE LOADS ─ run each once
+
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/state_name.csv'      AS row
+MERGE (:State       {name: row.state_name});
+
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/sa4_name.csv'        AS row
+MERGE (:SA4         {name: row.sa4_name});
+
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/lga_name.csv'        AS row
+MERGE (:LGA         {name: row.lga_name});
+
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/remoteness_name.csv' AS row
+MERGE (:Remoteness  {name: row.remoteness_name});
+
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/road_type_name.csv'  AS row
+MERGE (:RoadType    {name: row.road_type_name});
+
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/day_flag.csv'        AS row
+MERGE (:DayFlag     {name: row.day_flag});
+
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/time_of_day.csv'     AS row
+MERGE (:TimeOfDay   {name: row.time_of_day});
+
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/dayweek_text.csv'    AS row
+MERGE (:DayWeek     {name: row.dayweek_text});
+
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/holiday_period.csv'  AS row
+MERGE (:HolidayPeriod {name: row.period_name});
+
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/vehicle.csv'         AS row
+WITH DISTINCT row.vehicle_type AS vt
+MERGE (:VehicleType {name: vt});
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║  2.  FACT  – Crash & all dimension edges in ONE scan          ║
+// ╚═══════════════════════════════════════════════════════════════╝
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/crash.csv' AS row
+
+// ── 2-a  Crash node ──────────────────────────────────────────────
+MERGE (c:Crash {crash_id: toInteger(row.crash_id)})
+  ON CREATE SET
+    c.month            = toInteger(row.month),
+    c.year             = toInteger(row.year),
+    c.dayweek_text     = row.dayweek_text,
+    c.time_text        = row.time_text,
+    c.crash_type       = row.crash_type,
+    c.num_fatalities   = toInteger(row.num_fatalities),
+    c.speed_limit      = toInteger(row.speed_limit),
+    c.day_flag         = row.day_flag,
+    c.time_of_day      = row.time_of_day,
+    c.christmas_period = row.christmas_period,
+    c.easter_period    = row.easter_period,
+    c.load_ts          = row.load_ts
+
+// ── 2-b  link to all look-up dimensions in one round-trip ───────
+WITH c, row
+MATCH   (s:State       {name: row.state_name})
+MATCH   (sa:SA4        {name: row.sa4_name})
+MATCH   (l:LGA         {name: row.lga_name})
+MATCH   (r:Remoteness  {name: row.remoteness_name})
+MATCH   (rt:RoadType   {name: row.road_type_name})
+MATCH   (df:DayFlag    {name: row.day_flag})
+MATCH 	(dw:DayWeek {name:row.dayweek_text})
+MATCH 	(tod:TimeOfDay {name:row.time_of_day})
+
+// link Crash to the dims
+MERGE (c)-[:IN_STATE]        ->(s)
+MERGE (c)-[:IN_SA4]          ->(sa)
+MERGE (c)-[:IN_LGA]          ->(l)
+MERGE (c)-[:HAS_REMOTENESS]  ->(r)
+MERGE (c)-[:HAS_ROAD_TYPE]   ->(rt)
+MERGE (c)-[:HAS_DAY_FLAG]    ->(df)
+MERGE (c)-[:HAS_DAYWEEK]	 ->(dw)
+MERGE (c)-[:HAS_TIME_OF_DAY] ->(tod)
+
+// Geo-hierarchy edges
+MERGE (l)-[:INSIDE]			 ->(sa)
+MERGE (sa)-[:PART_OF]		 ->(s)
+
+
+// ── 2-c  holiday edges (conditional)
+WITH c, row
+MATCH (ch:HolidayPeriod {name: 'Christmas Period'})
+FOREACH (_ IN CASE WHEN row.christmas_period = 'Yes' THEN [1] ELSE [] END |
+  MERGE (c)-[:ON_HOLIDAY]->(ch)
+)
+WITH c, row
+MATCH (eh:HolidayPeriod {name: 'Easter Period'})
+FOREACH (_ IN CASE WHEN row.easter_period = 'Yes' THEN [1] ELSE [] END |
+  MERGE (c)-[:ON_HOLIDAY]->(eh)
+);
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║  3.  FACT  – Person & vehicle bridge                          ║
+// ╚═══════════════════════════════════════════════════════════════╝
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/person.csv' AS row
+
+// ── 3-a  person + relationship to crash ─────────────────────────
+MERGE (p:Person {person_id: toInteger(row.person_id)})
+  ON CREATE SET
+    p.road_user = row.road_user,
+    p.gender    = row.gender,
+    p.age       = toInteger(row.age),
+    p.age_group = row.age_group,
+    p.load_ts   = row.load_ts
+WITH p, row
+MATCH (c:Crash {crash_id: toInteger(row.crash_id)})
+MERGE (p)-[:INVOLVED_IN]->(c);
+
+
+
+// ── 3-b  vehicle bridge (Crash-[:HAS_VEHICLE]→VehicleType) ──────
+LOAD CSV WITH HEADERS FROM 'file:///csv_out/vehicle.csv' AS row
+MATCH (c:Crash {crash_id: toInteger(row.crash_id)})
+MATCH (v:VehicleType {name: row.vehicle_type})
+MERGE (c)-[:HAS_VEHICLE]->(v);
+
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 4. ANALYTIC QUERY A:
+//    WA crashes 2020–2024 with articulated trucks & >1 fatality
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MATCH (c:Crash)-[:IN_STATE]->(:State {name:'WA'})
+MATCH (c)-[:HAS_VEHICLE]->(:VehicleType {name:'articulatedtruck'})
+MATCH (p:Person)-[:INVOLVED_IN]->(c)
+MATCH (c)-[:IN_LGA]->(l:LGA)
+WHERE 2020 <= c.year <= 2024        // inclusive range filter
+  AND c.num_fatalities > 1
+RETURN
+  p.road_user      AS roadUser,
+  p.age            AS age,
+  p.gender         AS gender,
+  l.name           AS lgaName,
+  c.month          AS month,
+  c.year           AS year,
+  c.num_fatalities AS totalFatalities
+ORDER BY c.year, c.month, c.crash_id;
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 5. ANALYTIC QUERY B:
+//    Max/Min age by gender for motorcycle riders in holiday fatal crashes
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MATCH 
+  (p:Person {road_user:'Motorcycle rider'})-[:INVOLVED_IN]->(c:Crash)-[:HAS_REMOTENESS]->(:Remoteness {name:'Inner Regional Australia'})
+WHERE (c.christmas_period='Yes' OR c.easter_period='Yes')
+  AND c.num_fatalities > 0
+RETURN
+  p.gender   AS gender,
+  max(p.age) AS maxAge,
+  min(p.age) AS minAge;
+  
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 6. ANALYTIC QUERY C:
+//    Young drivers (17_to_25) in 2024 fatal crashes: weekends vs weekdays by state
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MATCH (p:Person {age_group:'17_to_25'})-[:INVOLVED_IN]->(c:Crash)-[:IN_STATE]->(s:State)
+WHERE c.year = 2024
+  AND c.num_fatalities > 0          // only fatal crashes
+WITH s.name   AS state,             // keep p & c for the aggregation step
+     p, c
+RETURN
+  state,
+  sum( CASE WHEN c.day_flag = 'Weekend' THEN 1 ELSE 0 END ) AS weekends,
+  sum( CASE WHEN c.day_flag = 'Weekday' THEN 1 ELSE 0 END ) AS weekdays,
+  round( avg( toFloat(p.age) ), 1 )                         AS averageAge
+ORDER BY state;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 7. ANALYTIC QUERY D:
+//    WA crashes on a Friday flagged weekend, >1 fatality, both genders involved
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MATCH (c:Crash)-[:IN_STATE]->(:State {name:'WA'})
+WHERE  c.dayweek_text = 'Friday'
+  AND  c.day_flag     = 'Weekend'
+  AND  c.num_fatalities > 1
+  // make sure both genders are present
+  AND  exists { MATCH (:Person {gender:'Male'})   -[:INVOLVED_IN]->(c) }
+  AND  exists { MATCH (:Person {gender:'Female'}) -[:INVOLVED_IN]->(c) }
+
+MATCH (c)-[:IN_SA4]->(sa:SA4)
+MATCH (c)-[:HAS_REMOTENESS]->(r:Remoteness)
+MATCH (c)-[:HAS_ROAD_TYPE]->(rt:RoadType)
+
+RETURN DISTINCT
+       sa.name AS sa4Name,
+       r.name  AS remoteness,
+       rt.name AS roadType
+ORDER BY sa4Name, remoteness, roadType;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 8. ANALYTIC QUERY E:
+//     Top 5 SA4 by fatal crashes during peak hours (inclusive)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MATCH (c:Crash)-[:IN_SA4]->(sa:SA4)
+WHERE c.num_fatalities > 0
+  AND (
+    c.time_text >= '07:00:00' AND c.time_text <= '09:00:00'  // morning peak inclusive
+    OR
+    c.time_text >= '16:00:00' AND c.time_text <= '18:00:00'  // afternoon peak inclusive
+  )
+WITH
+  sa.name AS sa4Name,
+  sum(CASE 
+        WHEN c.time_text >= '07:00:00' AND c.time_text <= '09:00:00' 
+        THEN 1 
+        ELSE 0 
+      END) AS MorningPeak,
+  sum(CASE 
+        WHEN c.time_text >= '16:00:00' AND c.time_text <= '18:00:00' 
+        THEN 1 
+        ELSE 0 
+      END) AS AfternoonPeak
+RETURN
+  sa4Name,
+  MorningPeak,
+  AfternoonPeak
+ORDER BY
+  (MorningPeak + AfternoonPeak) DESC
+LIMIT 5; 
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 8.1 Build LGA adjacency for Query F
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MATCH (l1:LGA)-[:INSIDE]->(sa:SA4)<-[:INSIDE]-(l2:LGA)
+WHERE id(l1) < id(l2)
+MERGE (l1)-[:CONNECTED]-(l2);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 9. ANALYTIC QUERY F:
+//     Find length-3 CONNECTED paths between any two LGAs
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MATCH p = (start:LGA)-[:CONNECTED*3]-(end:LGA)
+WHERE start.name < end.name                // one canonical direction
+WITH DISTINCT
+     start.name            AS startLGA,
+     end.name              AS endLGA,
+     [n IN nodes(p) | n.name] AS nodeSequence
+ORDER BY startLGA, endLGA
+LIMIT 3
+RETURN startLGA, endLGA, nodeSequence;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 10. ANALYTIC QUERY G: CITS5504 BONUS:
+//     Weekday pedestrian fatal crashes with bus or heavy-rigidtruck at speed<40 or ≥100
+//     Group by timeOfDay, ageGroup, vehicleType, speedLimit
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MATCH (p:Person {road_user:'Pedestrian'})-[:INVOLVED_IN]->(c:Crash)
+      -[:HAS_VEHICLE]->(v:VehicleType)
+WHERE c.day_flag          = 'Weekday'
+  AND c.num_fatalities    > 0               // fatal only
+  AND v.name              IN ['bus','heavyrigidtruck']
+  AND (c.speed_limit < 40 OR c.speed_limit >= 100)
+
+WITH
+  c.time_of_day                    AS timeOfDay,
+  p.age_group                      AS ageGroup,
+  v.name                           AS vehicleType,
+  CASE WHEN c.speed_limit < 40 
+       THEN '<40' 
+       ELSE '≥100'                 END       AS speedLimBand,
+  c.crash_id                       AS crashId      // for DISTINCT count
+RETURN
+  timeOfDay,
+  ageGroup,
+  vehicleType,
+  speedLimBand      AS speedLimit,
+  COUNT(DISTINCT crashId) AS crashCount
+ORDER BY
+  timeOfDay ASC,
+  ageGroup ASC;
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 11. EXTRA MEANINGFUL QUERIES:
+//     H1.Yearly fatalities trend per state (2019-2024)
+//     
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MATCH (c:Crash)-[:IN_STATE]->(s:State)
+WHERE c.year >= 2019
+RETURN s.name AS state,
+       c.year,
+       sum(c.num_fatalities) AS deaths
+ORDER BY state, c.year;
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 12. EXTRA MEANINGFUL QUERIES:
+//   H2 — Top 5 road-types by total fatalities
+//     
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MATCH (c:Crash)-[:HAS_ROAD_TYPE]->(rt:RoadType)
+RETURN rt.name AS roadType,
+       sum(c.num_fatalities) AS deaths
+ORDER BY deaths DESC
+LIMIT 5;
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
+// 13. Graph Data Science Application
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// 13.1 Compute Historical Averages & Label High-Risk LGAs
+MATCH (l:LGA)<-[:IN_LGA]-(c:Crash)
+WITH l, avg(c.num_fatalities) AS avgFatalities
+SET l.avgFatalities = avgFatalities;
+
+MATCH (l:LGA)
+WITH avg(l.avgFatalities) AS globalAvg
+MATCH (l2:LGA)
+SET l2.highRisk = (l2.avgFatalities > globalAvg);
+
+// 13.2 Convert boolean to numeric label
+MATCH (l:LGA)
+SET l.highRiskInt = CASE WHEN l.highRisk THEN 1 ELSE 0 END;
+
+// 13.3 Project the LGA Graph for GDS
+CALL gds.graph.drop('LGA_Network', false) YIELD graphName;
+CALL gds.graph.project(
+  'LGA_Network',
+  'LGA',
+  { CONNECTED: { orientation: 'UNDIRECTED' } },
+  { nodeProperties: ['highRiskInt'] }
+)
+YIELD graphName, nodeCount, relationshipCount;
+
+// 13.4 Build & Train a Classification Pipeline
+
+// 13.4.1 Drop the pipeline and all its models
+//CALL gds.beta.pipeline.drop('LGA_Risk_Pipeline_v2', true);
+
+
+// 13.4.2 Create a fresh pipeline
+CALL gds.beta.pipeline.nodeClassification.create('LGA_Risk_Pipeline_v2')
+YIELD name AS pipelineName;
+
+// 13.4.3 Mutate in-memory graph with Node2Vec embeddings
+CALL gds.beta.pipeline.nodeClassification.addNodeProperty(
+  'LGA_Risk_Pipeline_v2',
+  'gds.node2vec.mutate',
+  {
+    mutateProperty:      'embedding',
+    walkLength:         100,
+    walksPerNode:       50,
+    iterations:         15,
+    embeddingDimension:  128,
+	randomSeed:         42
+  }
+)
+YIELD nodePropertySteps;
+
+// 13.4.4 Select 'embedding' as the feature
+CALL gds.beta.pipeline.nodeClassification.selectFeatures(
+  'LGA_Risk_Pipeline_v2',
+  ['embedding']
+)
+YIELD featureProperties;
+
+// 13.4.5 Add a Random Forest model step
+CALL gds.alpha.pipeline.nodeClassification.addRandomForest(
+  'LGA_Risk_Pipeline_v2',
+  {
+    numberOfDecisionTrees: 200,
+    maxDepth:              20
+  }
+)
+YIELD parameterSpace;
+
+// 13.4.6 Train the pipeline (80% train / 20% test)
+CALL gds.beta.pipeline.nodeClassification.train(
+  'LGA_Network',
+  {
+    pipeline:          'LGA_Risk_Pipeline_v2',
+    targetNodeLabels:  ['LGA'],
+    targetProperty:    'highRiskInt',
+    modelName:         'LGA_RF_Pipeline_v2',
+    trainFraction:     0.8,
+    metrics:           ['ACCURACY','F1_WEIGHTED','F1_MACRO','OUT_OF_BAG_ERROR'],
+    randomSeed:        42,
+	overwrite:        true
+  }
+)
+YIELD modelInfo
+RETURN
+  modelInfo.metrics.ACCURACY.test     AS testAccuracy,
+  modelInfo.metrics.F1_WEIGHTED.test  AS testF1,
+  modelInfo.metrics['F1_MACRO'].test    AS F1Macro,
+  modelInfo.metrics.OUT_OF_BAG_ERROR    AS OOBError;
+  
+// 13.5 Write Predictions Back to the Graph
+CALL gds.beta.pipeline.nodeClassification.predict.write(
+  'LGA_Network',
+  {
+    modelName: 'LGA_RF_Pipeline_v2',
+    writeProperty: 'predictedHighRiskInt'
+  }
+)
+YIELD 
+  preProcessingMillis, 
+  computeMillis, 
+  postProcessingMillis, 
+  writeMillis, 
+  nodePropertiesWritten, 
+  configuration
+RETURN 
+  preProcessingMillis, 
+  computeMillis, 
+  postProcessingMillis, 
+  writeMillis, 
+  nodePropertiesWritten, 
+  configuration;
+  
+// 13.6 Inspect Top Predictions
+
+MATCH (l:LGA)
+RETURN
+  l.name                 AS LGA,
+  l.avgFatalities        AS historicalAvg,
+  l.highRiskInt          AS actualLabel,
+  l.predictedHighRiskInt AS predictedLabel
+ORDER BY
+  l.predictedHighRiskInt DESC,
+  l.avgFatalities       DESC
+LIMIT 10; 
